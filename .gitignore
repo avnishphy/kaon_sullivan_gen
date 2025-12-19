@@ -1,0 +1,8 @@
+/build/
+/.vscode/
+/.idea/
+*.o
+*.so
+*.a
+*.log
+*.root
