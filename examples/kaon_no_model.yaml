@@ -1,0 +1,32 @@
+# examples/kaon_no_models.yaml
+run:
+  n_events: 100000
+  seed: 424242
+  reaction: inclusive_sullivan
+  verbose: true
+
+beam:
+  E_e: 18.0  # electron beam energy (GeV)
+  E_p: 275.0    # proton beam energy (GeV) - collider
+
+kinematics:
+  x:
+    min: 0.01
+    max: 0.5
+  Q2:
+    min: 1.0
+    max: 5.0
+  t:
+    min: -1.0
+    max: -0.01
+
+sullivan:
+  z_default: 0.5
+
+unweighting:
+  max_weight: 0.0        # 0 -> prescan will estimate
+  prescan_events: 500
+
+output:
+  directory: output
+  filename: events_no_models.root

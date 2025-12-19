@@ -1,32 +1,58 @@
 # src/CMakeLists.txt
+# Build the main generator executable
 
-# Include directories
-include_directories(
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/src/core
-    ${CMAKE_SOURCE_DIR}/src/models
-    ${CMAKE_SOURCE_DIR}/src/io
+# Include project source dirs
+include_directories(${CMAKE_SOURCE_DIR}/src)
+include_directories(${CMAKE_SOURCE_DIR}/src/core)
+include_directories(${CMAKE_SOURCE_DIR}/src/io)
+include_directories(${CMAKE_SOURCE_DIR}/src/models)
+include_directories(${CMAKE_SOURCE_DIR}/src/physics)
+include_directories(${CMAKE_SOURCE_DIR}/src/adapters)
+
+set(SRC_MAIN
+  main.cpp
+  core/Generator.cpp
+  core/SullivanFlux.cpp
+  io/RootWriter.cpp
+#   models/ToyKaonModel.cpp
+  models/LHAPDFPdfModel.cpp
+  physics/StructureFunctions.cpp
+  physics/CrossSection.cpp
+  adapters/APFELAdapter.cpp
+  adapters/PARTONSAdapter.cpp
 )
 
-set(CORE_SOURCES
-    core/Generator.cpp
-    core/SullivanFlux.cpp
+add_executable(kaon_sullivan_gen ${SRC_MAIN})
+
+# Link libraries
+target_link_libraries(kaon_sullivan_gen
+  PRIVATE
+    ${ROOT_LIBRARIES}
+    yaml-cpp
 )
 
-set(IO_SOURCES
-    io/RootWriter.cpp
+# Include ROOT headers for targets
+target_include_directories(kaon_sullivan_gen PRIVATE ${ROOT_INCLUDE_DIRS})
+
+# ----------------------------
+# LHAPDF (via lhapdf-config)
+# ----------------------------
+find_program(LHAPDF_CONFIG lhapdf-config REQUIRED)
+
+execute_process(
+    COMMAND ${LHAPDF_CONFIG} --cflags
+    OUTPUT_VARIABLE LHAPDF_CFLAGS
+    OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 
-set(MODEL_SOURCES
-    models/ToyKaonModel.cpp
+execute_process(
+    COMMAND ${LHAPDF_CONFIG} --libs
+    OUTPUT_VARIABLE LHAPDF_LIBS
+    OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 
-# Main executable
-add_executable(kaon_sullivan_gen
-    main.cpp
-    ${CORE_SOURCES}
-    ${IO_SOURCES}
-    ${MODEL_SOURCES}
-)
+separate_arguments(LHAPDF_CFLAGS)
+separate_arguments(LHAPDF_LIBS)
 
-target_link_libraries(kaon_sullivan_gen ${ROOT_LIBRARIES} yaml-cpp)
+target_compile_options(kaon_sullivan_gen PRIVATE ${LHAPDF_CFLAGS})
+target_link_libraries(kaon_sullivan_gen PRIVATE ${LHAPDF_LIBS})
