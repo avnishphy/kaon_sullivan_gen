@@ -415,7 +415,7 @@ Typical fields set on `GenEvent` (as seen in the code and used by writers):
 
 ## Author / contact / TODOs
 
-* **Author/maintainer**: (insert your name/email)
+* **Author/maintainer**: (Avnish Singh; The Catholic University of America; singhav@cua.edu)
 * **TODOs & possible improvements**:
 
   * Implement proper GPD→PDF mapping or expose interface to pass a PDF already evolved to `Q²`.
