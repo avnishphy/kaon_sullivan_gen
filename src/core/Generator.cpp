@@ -6,9 +6,17 @@
 #include <stdexcept>
 #include <sstream>
 #include <iomanip>
+#include <random>
+#include <limits>
+#include <algorithm>
 
 #include "../physics/StructureFunctions.h"
 #include "../physics/CrossSection.h"
+
+// portable PI (compatible with C++17)
+namespace {
+    constexpr double PI = 3.14159265358979323846;
+}
 
 // ----------------- Constructor / Destructor -----------------
 Generator::Generator(const std::string &cfg_file, PdfModel* pdf_model, GpdModel* gpd_model)
@@ -55,6 +63,7 @@ void Generator::parse_config() {
             if (k["Q2"]["min"]) cfg_.Q2_min = k["Q2"]["min"].as<double>();
             if (k["Q2"]["max"]) cfg_.Q2_max = k["Q2"]["max"].as<double>();
         }
+        // t not used for sampling any more but keep values if present in YAML
         if (k["t"]) {
             if (k["t"]["min"]) cfg_.t_min = k["t"]["min"].as<double>();
             if (k["t"]["max"]) cfg_.t_max = k["t"]["max"].as<double>();
@@ -78,6 +87,13 @@ void Generator::parse_config() {
         if (u["prescan_events"]) cfg_.prescan_events = u["prescan_events"].as<unsigned>();
     }
 
+    // New optional parameters controlling Lambda pT sampling (kept optional)
+    if (root["Lambda"]) {
+        const YAML::Node &L = root["Lambda"];
+        if (L["pT0"]) cfg_.Lambda_pT0 = L["pT0"].as<double>();            // default 0.2
+        if (L["pT_max"]) cfg_.Lambda_pT_max = L["pT_max"].as<double>();    // default 1.5
+    }
+
     if (root["run"] && root["run"]["verbose"]) cfg_.verbose = root["run"]["verbose"].as<bool>();
 }
 
@@ -85,11 +101,15 @@ void Generator::parse_config() {
 void Generator::initialize() {
     parse_config();
 
+    // set defaults for new Lambda pT params if not provided
+    if (!(cfg_.Lambda_pT0 > 0.0)) cfg_.Lambda_pT0 = 0.20;     // GeV
+    if (!(cfg_.Lambda_pT_max > 0.0)) cfg_.Lambda_pT_max = 1.50; // GeV
+
     // RNG and sampling distributions
     rng_.seed(cfg_.seed);
     dist_x_ = std::uniform_real_distribution<double>(cfg_.x_min, cfg_.x_max);
     dist_Q2_ = std::uniform_real_distribution<double>(cfg_.Q2_min, cfg_.Q2_max);
-    dist_t_ = std::uniform_real_distribution<double>(cfg_.t_min, cfg_.t_max);
+    // do not sample t up-front; t is computed
     dist_u01_ = std::uniform_real_distribution<double>(0.0, 1.0);
 
     // prepare ROOT writer
@@ -123,6 +143,7 @@ void Generator::initialize() {
     if (cfg_.verbose) {
         std::cout << "[Generator] Initialization complete. Output: " << fullpath << "\n";
         std::cout << "  E_e = " << cfg_.E_beam_e << " GeV, E_p = " << cfg_.E_beam_p << " GeV\n";
+        std::cout << "  Lambda pT sampling: pT0 = " << cfg_.Lambda_pT0 << " GeV, pT_max = " << cfg_.Lambda_pT_max << " GeV\n";
     }
 }
 
@@ -134,8 +155,17 @@ void Generator::prescan_estimate_max_weight() {
         GenEvent ev;
         ev.x = dist_x_(rng_);
         ev.Q2 = dist_Q2_(rng_);
-        ev.t = dist_t_(rng_);
-        compute_full_kinematics(ev, cfg_.z_default);
+
+        // sample electron direction isotropically (uniform cos theta, uniform phi)
+        double u = dist_u01_(rng_);
+        double cos_th = 2.0*u - 1.0;
+        ev.theta_e = std::acos(std::clamp(cos_th, -1.0, 1.0));
+        ev.phi_e = 2.0 * PI * dist_u01_(rng_);
+
+        // compute kinematics (this will sample Lambda with pT-based proposal)
+        ev.z_lightcone = cfg_.z_default;
+        compute_full_kinematics(ev, ev.z_lightcone);
+
         double w = compute_weight_from_models(ev);
         if (w > maxw) maxw = w;
     }
@@ -147,12 +177,57 @@ void Generator::prescan_estimate_max_weight() {
 GenEvent Generator::sample_weighted_event(unsigned int id) {
     GenEvent ev;
     ev.evtid = id;
-    ev.x = dist_x_(rng_);
-    ev.Q2 = dist_Q2_(rng_);
-    ev.t = dist_t_(rng_);
-    // default z (should be sampled from Sullivan flux in realistic version)
-    ev.z_lightcone = cfg_.z_default;
-    compute_full_kinematics(ev, ev.z_lightcone);
+
+    const unsigned int max_attempts = 10000;
+    unsigned int attempt = 0;
+    bool success = false;
+
+    while (attempt < max_attempts && !success) {
+        ++attempt;
+
+        // sample primary kinematics
+        ev.x = dist_x_(rng_);
+        ev.Q2 = dist_Q2_(rng_);
+
+        // ----------------------------
+        // 1) scattered electron direction: isotropic sampling (spherical symmetry)
+        //    sample cos(theta) uniformly in [-1,1] and phi uniformly in [0,2pi)
+        // ----------------------------
+        double u_th = dist_u01_(rng_);
+        double cos_th_e = 2.0 * u_th - 1.0;            // uniform in [-1,1]
+        ev.theta_e = std::acos(std::clamp(cos_th_e, -1.0, 1.0));
+        ev.phi_e = 2.0 * PI * dist_u01_(rng_); // uniform phi
+
+        // compute kinematics (this will set k_in, P_in, sample Lambda with pT-based proposal and derive K = P - L)
+        ev.z_lightcone = cfg_.z_default; // placeholder; we'll derive xL from L later
+        compute_full_kinematics(ev, ev.z_lightcone);
+
+        // check that kaon has positive energy and finite values (otherwise resample)
+        if (!std::isfinite(ev.kaon.E()) || ev.kaon.E() <= 1e-9) {
+            continue; // resample
+        }
+
+        // enforce |t| < 0.9 already in compute_full_kinematics? if not, check here
+        if (!std::isfinite(ev.t) || std::abs(ev.t) >= 0.9) {
+            continue; // resample
+        }
+
+        // enforce that the inclusive X (ep->eXL) has a positive mass
+        if (!std::isfinite(ev.X_out.E()) || ev.X_out.E() <= 1e-9 || ev.X_out.M2() <= 1e-9){
+            continue; // resample
+        }
+
+        // All good
+        success = true;
+    }
+
+    if (!success) {
+        // failed to find a configuration
+        ev.is_physics_based = (pdf_model_ || gpd_model_);
+        ev.weight = 0.0;
+        ev.unweighted = 0;
+        return ev;
+    }
 
     // compute the physics weight (or placeholder if no model)
     if (!pdf_model_ && !gpd_model_) {
@@ -167,12 +242,14 @@ GenEvent Generator::sample_weighted_event(unsigned int id) {
 }
 
 // ----------------- compute_full_kinematics -----------------
-void Generator::compute_full_kinematics(GenEvent &ev, double z_lightcone) {
-    // masses
+// Proton-side sub-process is P -> K + L with L generated forward-peaked in pT (exponential).
+// Kaon is derived as K = P - L and may be off-shell. The electron scatters off that kaon (eK->eX) for weights.
+void Generator::compute_full_kinematics(GenEvent &ev, double /*z_lightcone_unused*/) {
+    // masses (GeV)
     const double m_e = 0.000511;
     const double m_p = 0.938272081;
-    const double m_L = 1.115683; // Lambda mass
-    const double m_K = 0.493677;
+    const double m_L = 1.115683; // Lambda mass (on-shell)
+    const double m_K = 0.493677; // Kaon nominal mass (we allow off-shell K)
 
     // Incoming beams: head-on collider convention:
     // Electron moves +z, Proton moves -z (opposite directions).
@@ -187,39 +264,29 @@ void Generator::compute_full_kinematics(GenEvent &ev, double z_lightcone) {
     double pz_p = -std::sqrt(std::max(0.0, E_p*E_p - m_p*m_p));
     ev.P_in.SetPxPyPzE(0.0, 0.0, pz_p, E_p);
 
-    // compute s = (k + P)^2:
+    // compute s = (k + P)^2 (legacy)
     TLorentzVector total = ev.k_in + ev.P_in;
     ev.s = total.M2();
 
-    // compute y using invariant definition y = (P·q)/(P·k)
-    // but first build k_out via Q2, x and approximations:
-    // We have chosen to sample x and Q2. Use y = Q2 / (x * s)
-    if (ev.x > 0 && ev.s > 0) {
-        ev.y = ev.Q2 / (ev.x * ev.s);
+    // ----------------------------
+    // Outgoing electron kinematics from sampled angles and Q2
+    // Using invariant relation (massless approximation where appropriate):
+    //   Q^2 = 2 k·k' ≈ 2 E_e E_out (1 - cos theta)
+    // => E_out = Q^2 / (2 E_e (1 - cos theta))
+    // Keep safe clamps when cos theta ~ 1.
+    // ----------------------------
+    double cos_th = std::cos(ev.theta_e);
+    double denom = 2.0 * E_e * (1.0 - cos_th);
+    double E_out = 0.0;
+    if (denom > 1e-12) {
+        E_out = ev.Q2 / denom;
     } else {
-        ev.y = 0.0;
+        // extremely forward scattering: clamp to near-beam energy
+        E_out = std::max(m_e + 1e-6, 0.99 * E_e);
     }
+    if (!std::isfinite(E_out) || E_out <= m_e) E_out = m_e + 1e-6;
 
-    // scattered electron energy in collider approximate (lab frame):
-    // In collider, relate Q2 = -q^2 = 4 E_e E_e' sin^2(theta/2) is more complicated.
-    // Use invariant relation: k'·P = (1 - y) k·P
-    double kdotP = ev.k_in.Dot(ev.P_in);
-    double kprime_dot_P = (1.0 - ev.y) * kdotP;
-    // Solve for k' energy in lab (E') approximately by assuming direction same as incoming electron (small angle)
-    // But better: compute E' from invariants: Q2 = - (k - k')^2 = 2 k·k' (neglect m_e)
-    // So, k·k' = Q2/2. We know k·k' = E_e*E_out - |p_e||p_out| cos theta ~ E_e*E_out (for small angles).
-    // We'll approximate E_out using y: E_out ≈ (1 - y) * E_e (collinear approx)
-    double E_out = (1.0 - ev.y) * E_e;
-    if (E_out <= m_e) E_out = m_e + 1e-6;
-
-    // scattering angle theta from Q2 relation: Q2 = 4 E_e E_out sin^2(theta/2)
-    double arg = ev.Q2 / (4.0 * E_e * E_out);
-    if (arg < 0.0) arg = 0.0;
-    if (arg > 1.0) arg = 1.0;
-    ev.theta_e = 2.0 * std::asin(std::sqrt(arg));
-    ev.phi_e = 0.0;
-
-    // k' 4-vector
+    // set outgoing electron momentum vector from sampled direction
     double p_out = std::sqrt(std::max(0.0, E_out*E_out - m_e*m_e));
     double px = p_out * std::sin(ev.theta_e) * std::cos(ev.phi_e);
     double py = p_out * std::sin(ev.theta_e) * std::sin(ev.phi_e);
@@ -228,28 +295,74 @@ void Generator::compute_full_kinematics(GenEvent &ev, double z_lightcone) {
 
     // virtual photon q = k - k'
     TLorentzVector q = ev.k_in - ev.k_out;
-    // Q2 from kinematics check
+
+    // store Q2-check (optional)
     double Q2_check = -q.M2();
-    (void)Q2_check; // optional check
+    (void)Q2_check;
 
-    // W2 = (P + q)^2
-    TLorentzVector Pplusq = ev.P_in + q;
-    ev.W2 = Pplusq.M2();
-
-    // Kaon and Lambda kinematics (placeholder)
-    // We put the kaon collinear with q direction with energy z * E_p (very approximate)
-    ev.z_lightcone = z_lightcone;
-    double E_kaon = std::max(m_K + 1e-6, z_lightcone * E_p);
-    TVector3 qdir = q.Vect().Unit();
-    double pka = std::sqrt(std::max(0.0, E_kaon*E_kaon - m_K*m_K));
-    ev.kaon.SetPxPyPzE(qdir.X()*pka, qdir.Y()*pka, qdir.Z()*pka, E_kaon);
-
-    // Lambda recoiling: approximate from momentum conservation: Lambda = P + q - kaon
-    TLorentzVector proton4(0.0, 0.0, pz_p, E_p);
-    ev.Lambda = proton4 + q - ev.kaon;
-
-    // compute x_L = (L·k)/(P·k)
+    // compute P·q and y if possible
+    double Pdotq = ev.P_in.Dot(q);
     double kdotP_val = ev.k_in.Dot(ev.P_in);
+    if (kdotP_val > 0.0) {
+        ev.y = Pdotq / kdotP_val;
+    } else {
+        if (ev.x > 0.0 && ev.s > 0.0) ev.y = ev.Q2 / (ev.x * ev.s);
+        else ev.y = 0.0;
+    }
+
+    // ----------------------------
+    // Proton-side: sample Lambda (L) with forward-peaked pT distribution (truncated exponential)
+    // Then derive kaon K = P - L (kaon may be off-shell).
+    //
+    // Strategy:
+    //  - sample pT from truncated exponential with scale pT0 up to pT_max
+    //  - sample phi uniform in [0,2pi)
+    //  - for given pT compute pz_max allowed so that E_L <= E_p - eps (so E_K > 0)
+    //  - sample pz uniformly in [-pz_max, pz_max]
+    // ----------------------------
+    double pT0 = cfg_.Lambda_pT0;
+    double pT_max = cfg_.Lambda_pT_max;
+    if (!(pT0 > 0.0)) pT0 = 0.20;
+    if (!(pT_max > 0.0)) pT_max = 1.50;
+
+    // truncated exponential inverse CDF:
+    // CDF(p) = (1 - exp(-p/p0)) / (1 - exp(-pTmax/p0))
+    double exp_cut = std::exp(-pT_max / pT0);
+    double u_pT = dist_u01_(rng_);
+    double one_minus_exp_cut = 1.0 - exp_cut;
+    if (one_minus_exp_cut <= 0.0) one_minus_exp_cut = 1e-12;
+    double pT = -pT0 * std::log(1.0 - u_pT * one_minus_exp_cut);
+
+    // phi for Lambda
+    ev.phi_L = 2.0 * PI * dist_u01_(rng_);
+
+    // compute maximum allowed |pz| given E_L <= E_p - eps
+    double eps = 1e-6;
+    double E_L_allowed_max = std::max(m_L, (E_p > m_L + eps ? E_p - eps : m_L));
+    double max_pz2 = std::max(0.0, E_L_allowed_max*E_L_allowed_max - m_L*m_L - pT*pT);
+    double pz_max = std::sqrt(max_pz2);
+
+    // if pz_max is zero, then pT is too large; clamp and set pz=0
+    double pz_L = 0.0;
+    if (pz_max > 0.0) {
+        // sample pz uniformly in [-pz_max, pz_max]
+        double u_pz = dist_u01_(rng_);
+        pz_L = (2.0 * u_pz - 1.0) * pz_max;
+    } else {
+        pz_L = 0.0;
+    }
+
+    // build Lambda 4-vector
+    double pxL = pT * std::cos(ev.phi_L);
+    double pyL = pT * std::sin(ev.phi_L);
+    double pL2 = pT*pT + pz_L*pz_L;
+    double E_L = std::sqrt(std::max(0.0, m_L*m_L + pL2));
+    ev.Lambda.SetPxPyPzE(pxL, pyL, pz_L, E_L);
+
+    // Now derive Kaon as K = P - L (may be off-shell)
+    ev.kaon = ev.P_in - ev.Lambda;
+
+    // compute xL = (L·k)/(P·k)
     if (kdotP_val != 0.0) {
         ev.xL = ev.Lambda.Dot(ev.k_in) / kdotP_val;
     } else {
@@ -261,13 +374,28 @@ void Generator::compute_full_kinematics(GenEvent &ev, double z_lightcone) {
 
     // compute t = (P - L)^2
     ev.t_calc = (ev.P_in - ev.Lambda).M2();
-    ev.t = ev.t_calc; // store computed t (overwrites sampled t as consistency)
+    ev.t = ev.t_calc; // computed t
 
-    // compute theta, phi, rapidity of Lambda
-    TVector3 pL = ev.Lambda.Vect();
-    ev.theta_L = pL.Theta();
-    ev.phi_L = pL.Phi();
-    ev.rapidity_L = 0.5 * std::log((ev.Lambda.E() + pL.Z()) / (ev.Lambda.E() - pL.Z() + 1e-12));
+    // if |t| too large, we'll rely on caller to resample; still compute angles
+    TVector3 pL_vec = ev.Lambda.Vect();
+    ev.theta_L = pL_vec.Theta();
+    ev.rapidity_L = 0.5 * std::log((ev.Lambda.E() + pL_vec.Z()) / (ev.Lambda.E() - pL_vec.Z() + 1e-12));
+
+    // compute xB from invariants: xB = Q2 / (2 P·q) if P·q > 0
+    if (Pdotq > 0.0) {
+        ev.xB = ev.Q2 / (2.0 * Pdotq);
+        ev.x = ev.xB;
+    } else {
+        ev.xB = 0.0;
+    }
+
+    // recompute y from invariants if possible
+    if (kdotP_val > 0.0) ev.y = Pdotq / kdotP_val;
+
+    // safety: clamp NaNs / infs
+    if (!std::isfinite(ev.xB)) ev.xB = 0.0;
+    if (!std::isfinite(ev.y)) ev.y = 0.0;
+    if (!std::isfinite(ev.pT_L)) ev.pT_L = 0.0;
 
     // compute t0: t0 = ((1-xL)/xL) * (m_L^2 - xL * m_p^2)
     if (ev.xL > 0.0) {
@@ -276,27 +404,17 @@ void Generator::compute_full_kinematics(GenEvent &ev, double z_lightcone) {
         ev.t0 = 0.0;
     }
 
-    // store xB from invariants: xB = Q2 / (2 P·q)
-    double Pdotq = ev.P_in.Dot(q);
-    if (Pdotq > 0.0) {
-        ev.xB = ev.Q2 / (2.0 * Pdotq);
-    } else {
-        ev.xB = 0.0;
-    }
+    // X = k_in + P_in - k_out - Lambda (ep->eXL)
+    ev.X_out = ev.k_in + ev.P_in - ev.k_out - ev.Lambda;
 
-    // y alternative definition
-    if (kdotP_val > 0.0) ev.y = Pdotq / kdotP_val;
+    // W2 = (P_in + k_in - k_out)**2 = (Lambda + X_out)^2
+    ev.W2 = (ev.Lambda + ev.X_out).M2();
 
-    // safety: if some values are NaN or inf, clamp them
-    if (!std::isfinite(ev.xB)) ev.xB = 0.0;
-    if (!std::isfinite(ev.y)) ev.y = 0.0;
-    if (!std::isfinite(ev.W2)) ev.W2 = 0.0;
-    if (!std::isfinite(ev.pT_L)) ev.pT_L = 0.0;
 }
 
-// ----------------- compute weight from models -----------------
+// ----------------- compute_weight from models -----------------
 double Generator::compute_weight_from_models(const GenEvent &ev) {
-    // If no models, 0.0 (should not be called if checked earlier)
+    // If no models, 1.0 (pure MC)
     if (!pdf_model_ && !gpd_model_) return 1.0;
 
     // Wrap GPD as PDF if necessary
@@ -320,18 +438,37 @@ double Generator::compute_weight_from_models(const GenEvent &ev) {
         pdf_view = temp_pdf.get();
     }
 
+    // Use electron-kaon invariant s_eK = (k + K)^2 for eK subprocess weight
+    TLorentzVector kplusK = ev.k_in + ev.kaon;
+    double s_eK = kplusK.M2();
+
     // optional: APFEL evolution call could go here to evolve pdf_view to ev.Q2
-    // For now compute LO F2 and then LO cross section
+    // For now compute LO F2 and then LO cross section using s_eK (so eK -> eX)
     double F2 = StructureFunctions::F2_LO(*pdf_view, ev.x, ev.Q2);
     double FL = StructureFunctions::FL_LO(*pdf_view, ev.x, ev.Q2);
-    double d2 = CrossSection::d2sigma_dx_dQ2_LO(*pdf_view, ev.x, ev.Q2, ev.s);
+
+    // If s_eK is not physically reasonable, guard it
+    if (!std::isfinite(s_eK) || s_eK <= 0.0) {
+        // fallback to proton-level s if needed
+        s_eK = ev.s > 0.0 ? ev.s : 1.0;
+    }
+
+    double d2 = CrossSection::d2sigma_dx_dQ2_LO(*pdf_view, ev.x, ev.Q2, s_eK);
     // Note: must include Jacobian if sampling not uniform in true measure.
 
     return d2;
 }
 
 // ----------------- unweight & write -----------------
+// Only store/write events that pass |t| < 0.9
 bool Generator::unweight_and_write_event(GenEvent &gev) {
+    // Apply t cut before writing: if event fails cut, treat as rejected
+    if (!std::isfinite(gev.t)) return false;
+    if (std::abs(gev.t) >= 0.9) {
+        // do not store this event
+        return false;
+    }
+
     double u = dist_u01_(rng_);
     double thresh = gev.weight / estimated_max_weight_;
     if (thresh > 1.0) {
@@ -342,7 +479,6 @@ bool Generator::unweight_and_write_event(GenEvent &gev) {
     if (u <= thresh) {
         gev.unweighted = 1;
         // write ROOT extended event -> requires RootWriter::fill_event_full(const GenEvent&)
-        // You must implement that method in RootWriter so that the entire GenEvent is stored.
         root_writer_->fill_event_full(gev);
 
         // write other outputs (placeholders)
@@ -374,14 +510,17 @@ void Generator::run() {
             continue;
         }
 
-        // If pure MC (no physics) weight is 1.0; do simple acceptance (always accept)
+        // If pure MC (no physics) weight is 1.0; accept only if it passes t cut
         if (!gev.is_physics_based) {
-            gev.unweighted = 1;
-            root_writer_->fill_event_full(gev);
-            ++n_accepted_;
+            if (std::isfinite(gev.t) && std::abs(gev.t) < 0.9) {
+                gev.unweighted = 1;
+                root_writer_->fill_event_full(gev);
+                ++n_accepted_;
+            }
             continue;
         }
 
+        // physics-based: unweight and write only if |t| < 0.9 (handled inside unweight_and_write_event)
         unweight_and_write_event(gev);
 
         if (cfg_.verbose && (n_generated_ % 1000 == 0)) {

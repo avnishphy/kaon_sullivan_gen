@@ -1,33 +1,3 @@
-// #pragma once
-
-// #include <string>
-// #include "TFile.h"
-// #include "TTree.h"
-
-// class RootWriter {
-// public:
-//     RootWriter(const std::string &fname);
-//     ~RootWriter();
-
-//     void initialize();
-//     void fill_event(int evtid, double x, double Q2, double t,
-//                     double weight, double pdf_k, double gpd);
-//     void write();
-
-// private:
-//     std::string fname_;
-//     TFile *tfile_;
-//     TTree *tree_;
-
-//     int evtid_;
-//     double x_;
-//     double Q2_;
-//     double t_;
-//     double weight_;
-//     double pdf_k_;
-//     double gpd_;
-// };
-
 #pragma once
 // RootWriter.h
 // Writes full GenEvent information into a ROOT TTree.
@@ -72,6 +42,7 @@ private:
   double L_px_, L_py_, L_pz_, L_E_;
   double kaon_px_, kaon_py_, kaon_pz_, kaon_E_;
   double photon_px_, photon_py_, photon_pz_, photon_E_;
+  double X_out_px_, X_out_py_, X_out_pz_, X_out_E_;
 
   // physics summary
   double xB_, y_, W2_, s_;

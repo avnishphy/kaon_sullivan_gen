@@ -1,53 +1,3 @@
-// #include "RootWriter.h"
-// #include <iostream>
-
-// RootWriter::RootWriter(const std::string &fname)
-//     : fname_(fname), tfile_(nullptr), tree_(nullptr)
-// {}
-
-// RootWriter::~RootWriter()
-// {
-//     if(tfile_) tfile_->Close();
-// }
-
-// void RootWriter::initialize()
-// {
-//     tfile_ = TFile::Open(fname_.c_str(), "RECREATE");
-//     if (!tfile_ || tfile_->IsZombie()) {
-//         std::cerr << "ERROR: Could not open ROOT file " << fname_ << "\n";
-//         return;
-//     }
-
-//     tree_ = new TTree("events", "kaon sullivan events");
-
-//     tree_->Branch("evtid",    &evtid_,   "evtid/I");
-//     tree_->Branch("x",        &x_,       "x/D");
-//     tree_->Branch("Q2",       &Q2_,      "Q2/D");
-//     tree_->Branch("t",        &t_,       "t/D");
-//     tree_->Branch("weight",   &weight_,  "weight/D");
-//     tree_->Branch("pdf_k",    &pdf_k_,   "pdf_k/D");
-//     tree_->Branch("gpd",      &gpd_,     "gpd/D");
-// }
-
-// void RootWriter::fill_event(int evtid, double x, double Q2, double t,
-//                             double weight, double pdf_k, double gpd)
-// {
-//     evtid_ = evtid;
-//     x_ = x;
-//     Q2_ = Q2;
-//     t_ = t;
-//     weight_ = weight;
-//     pdf_k_ = pdf_k;
-//     gpd_ = gpd;
-
-//     tree_->Fill();
-// }
-
-// void RootWriter::write()
-// {
-//     tfile_->Write();
-// }
-
 // RootWriter.cpp
 #include "RootWriter.h"
 #include <TFile.h>
@@ -116,6 +66,12 @@ void RootWriter::initialize() {
   tree_->Branch("photon_pz", &photon_pz_, "photon_pz/D");
   tree_->Branch("photon_E",  &photon_E_,  "photon_E/D");
 
+  // X (inclusive; ep->eXL)
+  tree_->Branch("X_out_px", &X_out_px_, "X_out_px/D");
+  tree_->Branch("X_out_py", &X_out_py_, "X_out_py/D");
+  tree_->Branch("X_out_pz", &X_out_pz_, "X_out_pz/D");
+  tree_->Branch("X_out_E",  &X_out_E_,  "X_out_E/D");
+
   // physics vars
   tree_->Branch("xB", &xB_, "xB/D");
   tree_->Branch("y",  &y_,  "y/D");
@@ -159,6 +115,7 @@ void RootWriter::fill_event(int evtid, double x, double Q2, double t, double wei
   L_px_ = L_py_ = L_pz_ = L_E_ = 0.0;
   kaon_px_ = kaon_py_ = kaon_pz_ = kaon_E_ = 0.0;
   photon_px_ = photon_py_ = photon_pz_ = photon_E_ = 0.0;
+  X_out_px_ = X_out_py_ = X_out_pz_ = X_out_E_ = 0.0;
   xB_ = y_ = W2_ = s_ = xL_ = pT_L_ = 0.0;
   theta_e_ = phi_e_ = theta_L_ = phi_L_ = rapidity_L_ = 0.0;
   t0_ = t_calc_ = 0.0;
@@ -205,6 +162,12 @@ void RootWriter::fill_event_full(const GenEvent &ev) {
   photon_py_ = ev.photon.Py();
   photon_pz_ = ev.photon.Pz();
   photon_E_  = ev.photon.E();
+
+  // inlcusive X
+  X_out_px_ = ev.X_out.Px();
+  X_out_py_ = ev.X_out.Py();
+  X_out_pz_ = ev.X_out.Pz();
+  X_out_E_  = ev.X_out.E();
 
   // physics
   xB_ = ev.xB; y_ = ev.y; W2_ = ev.W2; s_ = ev.s;

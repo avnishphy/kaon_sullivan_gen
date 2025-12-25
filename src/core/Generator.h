@@ -53,6 +53,7 @@ struct GenEvent {
     TLorentzVector Lambda; // outgoing Lambda (recoil baryon)
     TLorentzVector kaon;   // effective/virtual kaon
     TLorentzVector photon; // for exclusive DVCS-like
+    TLorentzVector X_out; // inclusive X; ep->eXL
 
     // physics variables
     double xB = 0.0;     // Bjorken x (x_B)
@@ -88,6 +89,7 @@ struct GeneratorConfig {
     double x_min = 0.01, x_max = 0.8;
     double Q2_min = 1.0, Q2_max = 10.0;
     double t_min = -1.0, t_max = 0.0;
+    double Lambda_pT0 = 0.2, Lambda_pT_max = 1.5;
 
     // Sullivan specifics
     double z_default = 0.5;
